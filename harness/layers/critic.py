@@ -78,17 +78,90 @@ class Critic(Middleware):
 
     name = "critic"
 
+    # ------------------------------------------------------------------ helpers
+
+    def _find_doc_for_text(self, text: str, ctx) -> str | None:
+        """Tìm doc_id của tài liệu đã đọc chứa text (case-insensitive, một dòng)."""
+        text_lower = text.lower()
+        for doc in ctx.corpus.docs:
+            if doc.body not in ctx.observed_text:
+                continue
+            for line in doc.body.splitlines():
+                if text_lower in line.lower():
+                    return doc.doc_id
+        return None
+
+    def _saw_ci(self, text: str, ctx) -> bool:
+        """Case-insensitive version của ctx.saw."""
+        return bool(text) and text.lower() in ctx.observed_text.lower()
+
+    # ------------------------------------------------------------------ hook
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept = []
+        has_contradiction = False
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text:
+                continue
+
+            # --- Trường hợp bình thường: khớp nguyên văn (case-sensitive) ---
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+
+            # --- Trường hợp (c): câu ghép hai nguồn, tách tại các separator ---
+            # MockModel thường ghép bằng " và và " (double) hoặc " và "
+            split_ok = False
+            for sep in (" và và ", " và ", " nhưng ", "; "):
+                idx = text.find(sep)
+                if idx == -1:
+                    continue
+                left = text[:idx].strip()
+                right = text[idx + len(sep):].strip()
+                if not left or not right:
+                    continue
+
+                # Mỗi nửa phải có trong observed_text (case-insensitive)
+                if not self._saw_ci(left, ctx) or not self._saw_ci(right, ctx):
+                    continue
+
+                # Tìm doc_id cho mỗi nửa — giữ TEXT của model (không sửa chữ)
+                left_doc = self._find_doc_for_text(left, ctx)
+                right_doc = self._find_doc_for_text(right, ctx)
+
+                if left_doc and right_doc and left_doc != right_doc:
+                    # text giữ nguyên là chữ model viết (substring hợp lệ)
+                    kept.append({"text": left, "doc_id": left_doc})
+                    kept.append({"text": right, "doc_id": right_doc})
+                    has_contradiction = True
+                    split_ok = True
+                    break
+
+            if split_ok:
+                continue
+
+            # --- Không tách được → bịa, bỏ đi ---
+
+        if has_contradiction:
+            report["abstain"] = True
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = (
+                "Không đủ căn cứ trong tài liệu đã tra cứu để trả lời câu hỏi này."
+            )
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
